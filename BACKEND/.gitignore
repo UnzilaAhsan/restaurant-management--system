@@ -1,0 +1,6 @@
+@"
+node_modules/
+.env
+logs/*.log
+package-lock.json
+"@ | Out-File -FilePath .gitignore -Encoding utf8
