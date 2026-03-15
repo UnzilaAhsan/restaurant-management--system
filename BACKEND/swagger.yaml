@@ -1,0 +1,882 @@
+openapi: 3.0.3
+info:
+  title: Restaurant Management System API
+  description: |
+    Production-ready REST API for a multi-branch restaurant management system.
+
+    ## Authentication
+    - **Admin** accounts use `/auth/login` and receive a JWT with `type: "admin"`.
+    - **Employee** accounts use `/auth/employee/login` and receive a JWT with `type: "employee"` and a `role` field.
+    - All protected endpoints require `Authorization: Bearer <token>`.
+
+    ## Roles
+    | Role     | role_id | Permissions |
+    |----------|---------|-------------|
+    | Chef     | 1       | Process inventory, view menu & orders |
+    | Waiter   | 2       | Create orders, view everything |
+    | Cashier  | 3       | Create payments, view everything |
+    | Admin    | N/A     | Shifts, reports, register admins |
+
+    ## Transaction Scenarios
+    1. **Create Order** – atomic multi-item insert with rollback
+    2. **Table Reservation** – SELECT FOR UPDATE prevents double-booking
+    3. **Shift Assignment** – overlap detection within transaction
+    4. **Process Inventory** – SERIALIZABLE deduction with shortage rollback
+
+  version: "1.0.0"
+  contact:
+    name: Restaurant API Support
+
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local development server
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Auth
+    description: Login and admin registration
+  - name: Orders
+    description: Order creation and retrieval
+  - name: Payments
+    description: Payment processing
+  - name: Reservations
+    description: Table reservations
+  - name: Tables
+    description: Dining table status management
+  - name: Inventory
+    description: Ingredient inventory management
+  - name: Menu
+    description: Menu, categories, and dishes
+  - name: Customers
+    description: Customer management
+  - name: Shifts
+    description: Employee shift scheduling
+  - name: Reports
+    description: Analytics and reporting
+
+paths:
+
+  # ── AUTH ────────────────────────────────────────────────────────
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Admin login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              username: superadmin
+              password: secret123
+      responses:
+        '200':
+          description: Successful login
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminLoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/employee/login:
+    post:
+      tags: [Auth]
+      summary: Employee login (name-based)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              username: Ali Hassan
+              password: ignored
+      responses:
+        '200':
+          description: Successful employee login
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmployeeLoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new admin (Super admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterAdminRequest'
+            example:
+              username: newadmin
+              password: strongpass99
+              access_level: Normal
+      responses:
+        '201':
+          description: Admin created
+          content:
+            application/json:
+              example:
+                success: true
+                admin_id: 3
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  # ── ORDERS ──────────────────────────────────────────────────────
+  /orders:
+    get:
+      tags: [Orders]
+      summary: List all orders
+      parameters:
+        - in: query
+          name: customer_id
+          schema:
+            type: integer
+          description: Filter by customer
+        - in: query
+          name: date
+          schema:
+            type: string
+            format: date
+          description: Filter by order date (YYYY-MM-DD)
+      responses:
+        '200':
+          description: Orders list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Orders]
+      summary: Create a new order (Waiter only)
+      description: |
+        **Transaction Scenario 1** – Atomically inserts Order + all OrderItems.
+        Rolls back on any failure (dish not found, customer/employee not found).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            example:
+              customer_id: 1
+              employee_id: 2
+              items:
+                - dish_id: 1
+                  quantity: 2
+                - dish_id: 3
+                  quantity: 1
+      responses:
+        '201':
+          description: Order created
+          content:
+            application/json:
+              example:
+                success: true
+                order_id: 42
+                item_count: 2
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get order by ID with items
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: Order detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /orders/{id}/process-inventory:
+    post:
+      tags: [Orders]
+      summary: Deduct inventory for completed order (Chef only)
+      description: |
+        **Transaction Scenario 4** – SERIALIZABLE transaction with UPDLOCK.
+        Rolls back entirely if any ingredient has insufficient stock.
+        Returns list of shortages on 409.
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: Inventory deducted
+          content:
+            application/json:
+              example:
+                success: true
+                deducted:
+                  - ingredient_id: 1
+                    ingredient_name: Flour
+                    deducted_by: 2
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Insufficient stock
+          content:
+            application/json:
+              example:
+                success: false
+                error: Insufficient stock for ingredients
+                details:
+                  - ingredient_id: 2
+                    ingredient_name: Tomatoes
+                    needed: 3
+                    available: 1
+
+  # ── PAYMENTS ────────────────────────────────────────────────────
+  /payments:
+    get:
+      tags: [Payments]
+      summary: List all payments
+      parameters:
+        - in: query
+          name: method
+          schema:
+            type: string
+            enum: [Cash, Card, Online]
+      responses:
+        '200':
+          description: Payments list
+    post:
+      tags: [Payments]
+      summary: Create payment for an order (Cashier only)
+      description: |
+        Amount is calculated **server-side** from OrderItems × dish prices.
+        Never pass amount from client.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentRequest'
+            example:
+              order_id: 42
+              method: Card
+      responses:
+        '201':
+          description: Payment created
+          content:
+            application/json:
+              example:
+                success: true
+                payment_id: 15
+                order_id: 42
+                amount: 45.50
+                method: Card
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /payments/{id}:
+    get:
+      tags: [Payments]
+      summary: Get payment by ID
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: Payment detail
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── RESERVATIONS ────────────────────────────────────────────────
+  /reservations:
+    get:
+      tags: [Reservations]
+      summary: List all reservations
+      responses:
+        '200':
+          description: Reservations list
+    post:
+      tags: [Reservations]
+      summary: Create a table reservation
+      description: |
+        **Transaction Scenario 2** – Uses `WITH (UPDLOCK, ROWLOCK)` to prevent
+        concurrent double-booking. Rolls back if table is not Available.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReservationRequest'
+            example:
+              customer_id: 1
+              table_id: 3
+              reservation_time: "2026-03-20T19:00:00"
+      responses:
+        '201':
+          description: Reservation created
+          content:
+            application/json:
+              example:
+                success: true
+                reservation_id: 7
+                table_id: 3
+                customer_id: 1
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Table not available
+
+  # ── TABLES ──────────────────────────────────────────────────────
+  /tables:
+    get:
+      tags: [Tables]
+      summary: List all dining tables
+      responses:
+        '200':
+          description: Tables list
+
+  /tables/{id}/status:
+    put:
+      tags: [Tables]
+      summary: Update table status
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [Available, Occupied, Reserved]
+            example:
+              status: Available
+      responses:
+        '200':
+          description: Status updated
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── INVENTORY ───────────────────────────────────────────────────
+  /inventory:
+    get:
+      tags: [Inventory]
+      summary: Get full inventory with supplier info
+      responses:
+        '200':
+          description: Inventory list
+
+  /inventory/low-stock:
+    get:
+      tags: [Inventory]
+      summary: Get low-stock ingredients
+      parameters:
+        - in: query
+          name: threshold
+          schema:
+            type: integer
+            default: 10
+      responses:
+        '200':
+          description: Low stock items
+
+  /inventory/{ingredient_id}:
+    put:
+      tags: [Inventory]
+      summary: Set ingredient quantity (Chef only)
+      parameters:
+        - in: path
+          name: ingredient_id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example:
+              quantity: 50
+      responses:
+        '200':
+          description: Quantity updated
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── MENU ────────────────────────────────────────────────────────
+  /menu:
+    get:
+      tags: [Menu]
+      summary: Full menu hierarchy (menus → categories → dishes)
+      responses:
+        '200':
+          description: Full menu
+
+  /menu/dishes:
+    get:
+      tags: [Menu]
+      summary: All dishes with category info
+      responses:
+        '200':
+          description: Dishes list
+
+  /menu/dishes/{id}:
+    get:
+      tags: [Menu]
+      summary: Dish detail with ingredient list
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: Dish detail
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /menu/categories:
+    get:
+      tags: [Menu]
+      summary: All categories with parent menu
+      responses:
+        '200':
+          description: Categories list
+
+  # ── CUSTOMERS ───────────────────────────────────────────────────
+  /customers:
+    get:
+      tags: [Customers]
+      summary: List customers with pagination and search
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+        - in: query
+          name: search
+          schema:
+            type: string
+          description: Search by name, phone, or email
+      responses:
+        '200':
+          description: Paginated customers
+    post:
+      tags: [Customers]
+      summary: Create a new customer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCustomerRequest'
+            example:
+              name: Sara Ahmed
+              phone: "03001234567"
+              email: sara@example.com
+      responses:
+        '201':
+          description: Customer created
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /customers/{id}:
+    get:
+      tags: [Customers]
+      summary: Get customer with order history
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+      responses:
+        '200':
+          description: Customer detail with orders
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── SHIFTS ──────────────────────────────────────────────────────
+  /shifts:
+    get:
+      tags: [Shifts]
+      summary: List all shifts (Admin only)
+      parameters:
+        - in: query
+          name: employee_id
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Shifts list
+    post:
+      tags: [Shifts]
+      summary: Assign employee shift (Admin only)
+      description: |
+        **Transaction Scenario 3** – Checks for overlapping shifts atomically.
+        Rolls back if a scheduling conflict is detected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateShiftRequest'
+            example:
+              employee_id: 1
+              start_time: "2026-03-15T08:00:00"
+              end_time: "2026-03-15T16:00:00"
+      responses:
+        '201':
+          description: Shift assigned
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Overlapping shift conflict
+
+  # ── REPORTS ─────────────────────────────────────────────────────
+  /reports/sales:
+    get:
+      tags: [Reports]
+      summary: Sales report for date range (Admin only)
+      parameters:
+        - in: query
+          name: start
+          required: true
+          schema:
+            type: string
+            format: date
+          example: "2026-01-01"
+        - in: query
+          name: end
+          required: true
+          schema:
+            type: string
+            format: date
+          example: "2026-03-31"
+      responses:
+        '200':
+          description: Sales summary
+          content:
+            application/json:
+              example:
+                success: true
+                period:
+                  start: "2026-01-01"
+                  end: "2026-03-31"
+                summary:
+                  total_orders: 120
+                  total_revenue: 4850.00
+                by_method:
+                  - method: Card
+                    transaction_count: 75
+                    method_revenue: 3200.00
+                  - method: Cash
+                    transaction_count: 45
+                    method_revenue: 1650.00
+
+  /reports/popular-dishes:
+    get:
+      tags: [Reports]
+      summary: Most ordered dishes (Admin only)
+      parameters:
+        - in: query
+          name: top
+          schema:
+            type: integer
+            default: 10
+      responses:
+        '200':
+          description: Ranked dish list
+
+  /reports/inventory-usage:
+    get:
+      tags: [Reports]
+      summary: Ingredient consumption report (Admin only)
+      responses:
+        '200':
+          description: Usage stats per ingredient
+
+  # ── HEALTH ──────────────────────────────────────────────────────
+  /health:
+    get:
+      tags: [Auth]
+      summary: Server health check (unauthenticated)
+      security: []
+      responses:
+        '200':
+          description: Server OK
+          content:
+            application/json:
+              example:
+                status: ok
+                db: connected
+                uptime: 3600
+                timestamp: "2026-03-13T12:00:00.000Z"
+        '500':
+          description: Database unreachable
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "JWT obtained from /auth/login or /auth/employee/login"
+
+  parameters:
+    IdParam:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: integer
+      description: Resource ID
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid token
+      content:
+        application/json:
+          example:
+            success: false
+            error: Authentication token required
+    Forbidden:
+      description: Insufficient role/access level
+      content:
+        application/json:
+          example:
+            success: false
+            error: Access restricted to roles: waiter
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          example:
+            success: false
+            error: Order 99 not found
+    BadRequest:
+      description: Validation error
+      content:
+        application/json:
+          example:
+            success: false
+            error: Validation failed
+            details:
+              - '"quantity" must be greater than 0'
+    Conflict:
+      description: Duplicate / conflict
+      content:
+        application/json:
+          example:
+            success: false
+            error: Phone number already registered
+
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          maxLength: 50
+        password:
+          type: string
+          minLength: 6
+
+    RegisterAdminRequest:
+      type: object
+      required: [username, password, access_level]
+      properties:
+        username:
+          type: string
+          maxLength: 50
+        password:
+          type: string
+          minLength: 8
+        access_level:
+          type: string
+          enum: [Super, Normal]
+
+    AdminLoginResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        token:
+          type: string
+        user:
+          type: object
+          properties:
+            admin_id:
+              type: integer
+            username:
+              type: string
+            access_level:
+              type: string
+
+    EmployeeLoginResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        token:
+          type: string
+        user:
+          type: object
+          properties:
+            employee_id:
+              type: integer
+            name:
+              type: string
+            role:
+              type: string
+            role_id:
+              type: integer
+
+    CreateOrderRequest:
+      type: object
+      required: [customer_id, employee_id, items]
+      properties:
+        customer_id:
+          type: integer
+        employee_id:
+          type: integer
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [dish_id, quantity]
+            properties:
+              dish_id:
+                type: integer
+              quantity:
+                type: integer
+                minimum: 1
+
+    OrderListResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        count:
+          type: integer
+        orders:
+          type: array
+          items:
+            type: object
+            properties:
+              order_id:
+                type: integer
+              order_time:
+                type: string
+                format: date-time
+              customer_name:
+                type: string
+              employee_name:
+                type: string
+
+    OrderDetailResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        order:
+          type: object
+          properties:
+            order_id:
+              type: integer
+            order_time:
+              type: string
+            customer_name:
+              type: string
+            employee_name:
+              type: string
+            total:
+              type: number
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  dish_name:
+                    type: string
+                  price:
+                    type: number
+                  quantity:
+                    type: integer
+                  subtotal:
+                    type: number
+
+    CreatePaymentRequest:
+      type: object
+      required: [order_id, method]
+      properties:
+        order_id:
+          type: integer
+        method:
+          type: string
+          enum: [Cash, Card, Online]
+
+    CreateReservationRequest:
+      type: object
+      required: [customer_id, table_id, reservation_time]
+      properties:
+        customer_id:
+          type: integer
+        table_id:
+          type: integer
+        reservation_time:
+          type: string
+          format: date-time
+
+    CreateCustomerRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        phone:
+          type: string
+          maxLength: 15
+        email:
+          type: string
+          format: email
+
+    CreateShiftRequest:
+      type: object
+      required: [employee_id, start_time, end_time]
+      properties:
+        employee_id:
+          type: integer
+        start_time:
+          type: string
+          format: date-time
+        end_time:
+          type: string
+          format: date-time
